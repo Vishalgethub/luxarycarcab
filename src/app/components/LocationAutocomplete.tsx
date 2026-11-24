@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader';
 import { MapPin, Map as MapIcon, X } from 'lucide-react';
+import 'leaflet/dist/leaflet.css';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
@@ -12,8 +13,37 @@ type Suggestion = {
   id: string;
   value: string;
   label: string;
-  source: 'google' | 'csv';
+  source: 'google' | 'osm' | 'csv';
 };
+
+type FreeGeocodeResult = { label: string; lat: number; lon: number };
+
+async function fetchFreeSuggestions(query: string): Promise<Suggestion[]> {
+  try {
+    const res = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
+    if (!res.ok) return [];
+    const json = (await res.json()) as { results?: FreeGeocodeResult[] };
+    return (json.results || []).map((r, i) => ({
+      id: `osm-${i}-${r.lat},${r.lon}`,
+      value: r.label,
+      label: r.label,
+      source: 'osm' as const,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function reverseGeocodeFree(lat: number, lon: number): Promise<string | null> {
+  try {
+    const res = await fetch(`/api/geocode?lat=${lat}&lon=${lon}`);
+    if (!res.ok) return null;
+    const json = (await res.json()) as { results?: FreeGeocodeResult[] };
+    return json.results?.[0]?.label || null;
+  } catch {
+    return null;
+  }
+}
 
 type LayoutDebugInfo = {
   vw: number;
@@ -230,12 +260,28 @@ export function LocationAutocomplete({ placeholder, value, onChange, className, 
           source: 'csv' as const,
         }))
         .filter((item, index, self) => self.findIndex((entry) => entry.value === item.value) === index)
-        .slice(0, googleMapsApiKey ? 4 : 8);
+        .slice(0, 4);
+
+      const showMerged = (primary: Suggestion[]) => {
+        const seen = new Set(primary.map((item) => item.value.toLowerCase()));
+        const merged = [...primary, ...csvSuggestions.filter((item) => !seen.has(item.value.toLowerCase()))].slice(0, 8);
+        setSuggestions(merged);
+        setSuggestionsOpen(merged.length > 0);
+        setActiveIndex(-1);
+      };
+
+      const loadFree = () => {
+        // Show local matches instantly, then add free OpenStreetMap results.
+        showMerged([]);
+        if (value.trim().length < 3) return;
+        fetchFreeSuggestions(value.trim()).then((osm) => {
+          if (currentRequestId !== requestIdRef.current) return;
+          showMerged(osm);
+        });
+      };
 
       if (!googleMapsApiKey || !autocompleteServiceRef.current) {
-        setSuggestions(csvSuggestions);
-        setSuggestionsOpen(csvSuggestions.length > 0);
-        setActiveIndex(-1);
+        loadFree();
         ensurePlacesReady();
         return;
       }
@@ -250,6 +296,15 @@ export function LocationAutocomplete({ placeholder, value, onChange, className, 
         (predictions, status) => {
           if (currentRequestId !== requestIdRef.current) return;
 
+          // Google key invalid/expired/billing off -> use the free provider instead.
+          if (
+            status !== google.maps.places.PlacesServiceStatus.OK &&
+            status !== google.maps.places.PlacesServiceStatus.ZERO_RESULTS
+          ) {
+            loadFree();
+            return;
+          }
+
           const googleSuggestions =
             status === google.maps.places.PlacesServiceStatus.OK && predictions
               ? predictions.slice(0, 6).map((prediction) => ({
@@ -260,21 +315,56 @@ export function LocationAutocomplete({ placeholder, value, onChange, className, 
                 }))
               : [];
 
-          const seen = new Set(googleSuggestions.map((item) => item.value.toLowerCase()));
-          const merged = [
-            ...googleSuggestions,
-            ...csvSuggestions.filter((item) => !seen.has(item.value.toLowerCase())),
-          ].slice(0, 8);
-
-          setSuggestions(merged);
-          setSuggestionsOpen(merged.length > 0);
-          setActiveIndex(-1);
+          showMerged(googleSuggestions);
         },
       );
-    }, 150);
+    }, 250);
 
     return () => window.clearTimeout(timer);
   }, [value, csvData, googleMapsApiKey, placesReady, ensurePlacesReady]);
+
+  // Free map picker: Leaflet + OpenStreetMap tiles (used when no Google key is set).
+  useEffect(() => {
+    if (!showMapPicker || googleMapsApiKey || !mapRef.current) return;
+
+    let disposed = false;
+    let map: import('leaflet').Map | null = null;
+
+    (async () => {
+      const L = (await import('leaflet')).default;
+      if (disposed || !mapRef.current) return;
+
+      map = L.map(mapRef.current, {
+        center: [-36.8485, 174.7633],
+        zoom: 12,
+        maxBounds: [
+          [NEW_ZEALAND_BOUNDS.south, NEW_ZEALAND_BOUNDS.west],
+          [NEW_ZEALAND_BOUNDS.north, NEW_ZEALAND_BOUNDS.east],
+        ],
+      });
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map);
+
+      const marker = L.circleMarker([0, 0], { radius: 9, color: '#ca8a04', fillColor: '#facc15', fillOpacity: 0.9 });
+
+      map.on('click', async (e: import('leaflet').LeafletMouseEvent) => {
+        const { lat, lng } = e.latlng;
+        if (map) marker.setLatLng([lat, lng]).addTo(map);
+        const label = await reverseGeocodeFree(lat, lng);
+        if (disposed) return;
+        selectSuggestion(label || `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
+        setShowMapPicker(false);
+      });
+    })();
+
+    return () => {
+      disposed = true;
+      map?.remove();
+      map = null;
+    };
+  }, [showMapPicker, googleMapsApiKey, selectSuggestion]);
 
   useEffect(() => {
     if (!showMapPicker || !mapsReadyRef.current || !mapRef.current) return;
@@ -373,7 +463,7 @@ export function LocationAutocomplete({ placeholder, value, onChange, className, 
           className={`pl-12 pr-12 font-semibold border-2 truncate ${className ? className : ''}`}
         />
 
-        {googleMapsApiKey ? (
+        {(
           <Button
             type="button"
             variant="ghost"
@@ -384,7 +474,7 @@ export function LocationAutocomplete({ placeholder, value, onChange, className, 
           >
             <MapIcon className="h-5 w-5" />
           </Button>
-        ) : null}
+        )}
 
         {suggestionsOpen ? (
           <div className="absolute left-0 right-0 top-full z-[99999] mt-1 w-full max-w-full overflow-hidden rounded-md border-2 border-yellow-200 bg-white shadow-xl">
@@ -403,7 +493,7 @@ export function LocationAutocomplete({ placeholder, value, onChange, className, 
                 <div className="flex min-w-0 items-center justify-between gap-3">
                   <span className="min-w-0 flex-1 truncate">{suggestion.label}</span>
                   <span className="shrink-0 text-[10px] uppercase tracking-wide text-gray-400">
-                    {suggestion.source === 'google' ? 'Maps' : 'Local'}
+                    {suggestion.source === 'csv' ? 'Local' : 'Maps'}
                   </span>
                 </div>
               </button>

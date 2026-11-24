@@ -1,55 +1,43 @@
 import { NextResponse } from 'next/server';
+import { formatPhotonLabel, photonReverse, photonSearch } from '@/lib/freeMaps';
 
-type OpenMeteoGeocodingResponse = {
-  results?: { name?: string; admin1?: string; country?: string }[];
-};
-
-const NEW_ZEALAND_COUNTRY = 'New Zealand';
-
+// Free address search + reverse geocoding for New Zealand (no API key).
+// Powered by Photon (OpenStreetMap data): https://photon.komoot.io
+//
+//   GET /api/geocode?q=auckland airport       -> suggestions
+//   GET /api/geocode?lat=-36.84&lon=174.76     -> address for a point
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const q = (url.searchParams.get('q') || '').trim();
-  const debug = url.searchParams.get('debug') === '1' || process.env.DEBUG_GEOCODE === '1';
-
-  if (q.length < 3) return NextResponse.json({ results: [] });
+  const lat = Number(url.searchParams.get('lat'));
+  const lon = Number(url.searchParams.get('lon'));
 
   try {
-    // Free alternative without API key.
-    // Open-Meteo Geocoding API is typically more permissive than public Nominatim endpoints.
-    const upstream = new URL('https://geocoding-api.open-meteo.com/v1/search');
-    upstream.searchParams.set('name', q);
-    upstream.searchParams.set('count', '6');
-    upstream.searchParams.set('countryCode', 'NZ');
-    upstream.searchParams.set('language', 'en');
-    upstream.searchParams.set('format', 'json');
-
-    const res = await fetch(upstream.toString(), {
-      headers: {
-        Accept: 'application/json',
-      },
-      cache: 'no-store',
-    });
-
-    if (!res.ok) {
-      return NextResponse.json(
-        debug ? { results: [], debug: { upstreamStatus: res.status, upstreamUrl: upstream.toString() } } : { results: [] },
-        { status: 200 },
-      );
+    if (url.searchParams.has('lat') && url.searchParams.has('lon')) {
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return NextResponse.json({ results: [] });
+      const feature = await photonReverse(lat, lon);
+      const results = feature ? [{ label: formatPhotonLabel(feature), lat, lon }] : [];
+      return NextResponse.json({ results });
     }
 
-    const text = await res.text();
-    const data = (JSON.parse(text) as OpenMeteoGeocodingResponse) || {};
-    const results = (Array.isArray(data.results) ? data.results : [])
-      .filter((r) => r.country === NEW_ZEALAND_COUNTRY)
-      .map((r) => [r.name, r.admin1, r.country].filter(Boolean).join(', '))
-      .filter((name) => name.trim().length > 0);
+    if (q.length < 3) return NextResponse.json({ results: [] });
+
+    const features = await photonSearch(q, 6);
+    const seen = new Set<string>();
+    const results = features
+      .map((f) => ({ label: formatPhotonLabel(f), lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1] }))
+      .filter((r) => {
+        const key = r.label.toLowerCase();
+        if (!r.label || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
     return NextResponse.json(
-      debug
-        ? { results, debug: { upstreamStatus: res.status, upstreamUrl: upstream.toString(), sample: text.slice(0, 200) } }
-        : { results },
+      { results },
+      { headers: { 'Cache-Control': 'public, s-maxage=86400, stale-while-revalidate=604800' } },
     );
   } catch {
-    return NextResponse.json(debug ? { results: [], debug: { error: 'fetch_failed' } } : { results: [] }, { status: 200 });
+    return NextResponse.json({ results: [] });
   }
 }

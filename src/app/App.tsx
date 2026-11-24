@@ -285,18 +285,46 @@ export default function App() {
     }
 
     const googleMapsApiKey = (process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || '').trim();
-    if (!googleMapsApiKey) {
-      setRouteInfo(null);
-      setRouteInfoLoading(false);
-      setRouteInfoError('Add NEXT_PUBLIC_GOOGLE_MAPS_API_KEY to show distance.');
-      return;
-    }
 
     let cancelled = false;
     setRouteInfoLoading(true);
     setRouteInfoError(null);
 
-    // Use Maps JS API DistanceMatrixService for approximate distance/duration.
+    // Free fallback (OpenStreetMap via /api/route) — no API key required.
+    const loadFreeRoute = async () => {
+      try {
+        const res = await fetch(
+          `/api/route?from=${encodeURIComponent(pickup)}&to=${encodeURIComponent(dropoff)}`,
+        );
+        const json = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (!res.ok || !json?.distanceText) {
+          setRouteInfo(null);
+          setRouteInfoError('Distance unavailable for these locations.');
+        } else {
+          setRouteInfo({ distanceText: json.distanceText, durationText: json.durationText || '' });
+        }
+      } catch {
+        if (cancelled) return;
+        setRouteInfo(null);
+        setRouteInfoError('Distance unavailable right now.');
+      } finally {
+        if (!cancelled) setRouteInfoLoading(false);
+      }
+    };
+
+    const timer = window.setTimeout(() => {
+      if (!googleMapsApiKey) void loadFreeRoute();
+    }, 400);
+
+    if (!googleMapsApiKey) {
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+      };
+    }
+
+    // Google Maps DistanceMatrixService (only when a key is set); falls back to the free route on failure.
     (async () => {
       try {
         setOptions({ key: googleMapsApiKey, v: 'weekly', region: 'NZ' });
@@ -315,18 +343,14 @@ export default function App() {
           (response, status) => {
             if (cancelled) return;
             if (status !== 'OK' || !response?.rows?.[0]?.elements?.[0]) {
-              setRouteInfo(null);
-              setRouteInfoLoading(false);
-              setRouteInfoError('Distance unavailable (check Google APIs/billing).');
+              void loadFreeRoute();
               return;
             }
             const el = response.rows[0].elements[0];
             const distanceText = el.distance?.text || '';
             const durationText = el.duration?.text || '';
             if (!distanceText && !durationText) {
-              setRouteInfo(null);
-              setRouteInfoLoading(false);
-              setRouteInfoError('Distance unavailable (no route found).');
+              void loadFreeRoute();
               return;
             }
             setRouteInfo({ distanceText, durationText });
@@ -335,14 +359,13 @@ export default function App() {
         );
       } catch {
         if (cancelled) return;
-        setRouteInfo(null);
-        setRouteInfoLoading(false);
-        setRouteInfoError('Distance unavailable (check Google APIs/billing).');
+        void loadFreeRoute();
       }
     })();
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [formData.pickup, formData.dropoff]);
 
